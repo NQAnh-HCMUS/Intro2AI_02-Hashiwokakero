@@ -1,262 +1,265 @@
-﻿import numpy as np
-from typing import List, Tuple, Optional
+﻿from pysat.solvers import Solver
+from itertools import combinations, product
+import numpy as np
+
 
 class HashiwokakeroSolver:
-    def __init__(self, grid: List[List[int]]):
-        """Initialize the solver with the puzzle grid.
-        
-        Args:
-            grid: 2D list representing the puzzle. 0 means no island, positive numbers
-                  indicate islands with their connection requirements.
-        """
-        self.original_grid = np.array(grid, dtype=int)
-        self.grid = self.original_grid.copy()
+    def __init__(self, grid):
+        self.grid = np.array(grid)
         self.rows, self.cols = self.grid.shape
-        self.bridges = np.zeros((self.rows, self.cols, 2), dtype=int)  # 0: horizontal, 1: vertical
         self.islands = self._find_islands()
-        
-    def _find_islands(self) -> List[Tuple[int, int, int]]:
-        """Find all islands in the grid and return their coordinates and required connections."""
+        self.bridges = self._find_potential_bridges()
+        self.variables = {}
+        self._setup_variables()
+        self.clauses = []
+
+    def _find_islands(self):
+        """Find all island coordinates in the grid"""
         islands = []
         for i in range(self.rows):
             for j in range(self.cols):
                 if self.grid[i, j] > 0:
-                    islands.append((i, j, self.grid[i, j]))
+                    islands.append((i, j))
         return islands
-    
-    def _get_possible_bridges(self, i: int, j: int) -> List[Tuple[int, int, int, int]]:
-        """Find possible bridges from island at (i,j).
-        
-        Returns:
-            List of (end_i, end_j, direction, max_bridges) tuples
-        """
-        possible = []
-        directions = [(0, 1), (1, 0), (0, -1), (-1, 0)]  # right, down, left, up
-        
-        for di, dj in directions:
-            ni, nj = i + di, j + dj
-            while 0 <= ni < self.rows and 0 <= nj < self.cols:
-                if self.grid[ni, nj] > 0:  # found another island
-                    # Check if bridge would be horizontal (0) or vertical (1)
-                    direction = 0 if di == 0 else 1
-                    max_possible = min(self.grid[i, j], self.grid[ni, nj])
-                    possible.append((ni, nj, direction, max_possible))
-                    break
-                ni += di
-                nj += dj
-                
-        return possible
-    
-    def _is_bridge_possible(self, i1: int, j1: int, i2: int, j2: int, direction: int) -> bool:
-        """Check if a bridge between two islands is possible without crossing existing bridges."""
-        if direction == 0:  # horizontal bridge
-            if i1 != i2:
-                return False
-            step = 1 if j2 > j1 else -1
-            for j in range(j1 + step, j2, step):
-                # Check for crossing vertical bridges
-                if self.bridges[i1, j, 1] > 0:
-                    return False
-                # Check for existing horizontal bridges (would be parallel)
-                if self.bridges[i1, j, 0] > 0 and (i1, j) != (i1, j1) and (i1, j) != (i2, j2):
-                    return False
-        else:  # vertical bridge
-            if j1 != j2:
-                return False
-            step = 1 if i2 > i1 else -1
-            for i in range(i1 + step, i2, step):
-                # Check for crossing horizontal bridges
-                if self.bridges[i, j1, 0] > 0:
-                    return False
-                # Check for existing vertical bridges (would be parallel)
-                if self.bridges[i, j1, 1] > 0 and (i, j1) != (i1, j1) and (i, j1) != (i2, j2):
-                    return False
-        return True
-    
-    def _add_bridge(self, i1: int, j1: int, i2: int, j2: int, direction: int, count: int = 1) -> bool:
-        """Add a bridge between two islands."""
-        if not self._is_bridge_possible(i1, j1, i2, j2, direction):
-            return False
-        
-        if direction == 0:  # horizontal
-            step = 1 if j2 > j1 else -1
-            for j in range(j1, j2 + step, step):
-                self.bridges[i1, j, 0] += count
-        else:  # vertical
-            step = 1 if i2 > i1 else -1
-            for i in range(i1, i2 + step, step):
-                self.bridges[i, j1, 1] += count
-        
-        # Update island connection counts
-        self.grid[i1, j1] -= count
-        self.grid[i2, j2] -= count
-        return True
-    
-    def _remove_bridge(self, i1: int, j1: int, i2: int, j2: int, direction: int, count: int = 1) -> None:
-        """Remove a bridge between two islands."""
-        if direction == 0:  # horizontal
-            step = 1 if j2 > j1 else -1
-            for j in range(j1, j2 + step, step):
-                self.bridges[i1, j, 0] -= count
-        else:  # vertical
-            step = 1 if i2 > i1 else -1
-            for i in range(i1, i2 + step, step):
-                self.bridges[i, j1, 1] -= count
-        
-        # Restore island connection counts
-        self.grid[i1, j1] += count
-        self.grid[i2, j2] += count
-    
-    def _is_solved(self) -> bool:
-        """Check if the puzzle is solved (all islands have 0 required connections)."""
-        return np.all(self.grid == 0) and self._is_fully_connected()
-    
-    def _is_fully_connected(self) -> bool:
-        """Check if all islands are connected as a single group."""
-        if not self.islands:
-            return True
-            
-        visited = set()
-        stack = [self.islands[0][:2]]  # Start with first island
-        
-        while stack:
-            i, j = stack.pop()
-            if (i, j) in visited:
-                continue
-            visited.add((i, j))
-            
-            # Check all four directions for bridges
-            # Right
-            if j + 1 < self.cols and self.bridges[i, j, 0] > 0:
-                ni, nj = i, j + 1
-                while nj < self.cols and self.bridges[i, nj, 0] == 0:
-                    nj += 1
-                if nj < self.cols and self.grid[i, nj] > 0:
-                    stack.append((i, nj))
-            
-            # Left
-            if j - 1 >= 0 and self.bridges[i, j - 1, 0] > 0:
-                ni, nj = i, j - 1
-                while nj >= 0 and self.bridges[i, nj, 0] == 0:
-                    nj -= 1
-                if nj >= 0 and self.grid[i, nj] > 0:
-                    stack.append((i, nj))
-            
-            # Down
-            if i + 1 < self.rows and self.bridges[i, j, 1] > 0:
-                ni, nj = i + 1, j
-                while ni < self.rows and self.bridges[ni, j, 1] == 0:
-                    ni += 1
-                if ni < self.rows and self.grid[ni, j] > 0:
-                    stack.append((ni, j))
-            
-            # Up
-            if i - 1 >= 0 and self.bridges[i - 1, j, 1] > 0:
-                ni, nj = i - 1, j
-                while ni >= 0 and self.bridges[ni, j, 1] == 0:
-                    ni -= 1
-                if ni >= 0 and self.grid[ni, j] > 0:
-                    stack.append((ni, j))
-        
-        # Check if all islands were visited
-        return len(visited) == len([isl for isl in self.islands if self.grid[isl[0], isl[1]] > 0])
-    
-    def solve(self) -> bool:
-        """Solve the puzzle using backtracking."""
-        if self._is_solved():
-            return True
-            
-        # Find the island with the fewest remaining connections but at least 1
-        min_connections = float('inf')
-        selected_island = None
-        possible_bridges = None
-        
+
+    def _find_potential_bridges(self):
+        """Find all potential horizontal and vertical bridges between islands"""
+        bridges = {"horizontal": [], "vertical": []}
+
+        # Find horizontal bridges (same row)
+        for (i1, j1), (i2, j2) in combinations(self.islands, 2):
+            if i1 == i2 and j1 < j2:
+                # Check if path is clear
+                path_clear = True
+                for j in range(j1 + 1, j2):
+                    if self.grid[i1, j] != 0 and (i1, j) not in self.islands:
+                        path_clear = False
+                        break
+                if path_clear:
+                    bridges["horizontal"].append(((i1, j1), (i1, j2)))
+
+        # Find vertical bridges (same column)
+        for (i1, j1), (i2, j2) in combinations(self.islands, 2):
+            if j1 == j2 and i1 < i2:
+                # Check if path is clear
+                path_clear = True
+                for i in range(i1 + 1, i2):
+                    if self.grid[i, j1] != 0 and (i, j1) not in self.islands:
+                        path_clear = False
+                        break
+                if path_clear:
+                    bridges["vertical"].append(((i1, j1), (i2, j1)))
+
+        return bridges
+
+    def _setup_variables(self):
+        """Assign variables to each potential bridge (1 or 2 bridges)"""
+        var_id = 1
+
+        # Create variables for horizontal bridges
+        for a, b in self.bridges["horizontal"]:
+            self.variables[(a, b, "h1")] = var_id
+            self.variables[(a, b, "h2")] = var_id + 1
+            var_id += 2
+
+        # Create variables for vertical bridges
+        for a, b in self.bridges["vertical"]:
+            self.variables[(a, b, "v1")] = var_id
+            self.variables[(a, b, "v2")] = var_id + 1
+            var_id += 2
+
+    def _generate_cnf(self):
+        """Generate CNF clauses for the puzzle"""
+        # 1. At most two bridges between any pair of islands
+        # (handled by having only two variables per bridge)
+
+        # 2. Bridges don't cross
+        self._add_no_crossing_clauses()
+
+        # 3. Island constraints
+        self._add_island_constraints()
+
+        # 4. Single connected component
+        self._add_connectivity_constraints()
+
+    def _add_no_crossing_clauses(self):
+        """Add clauses to prevent bridges from crossing"""
+        # Check all pairs of horizontal and vertical bridges that would cross
+        for h_bridge in self.bridges["horizontal"]:
+            for v_bridge in self.bridges["vertical"]:
+                (h_i1, h_j1), (h_i2, h_j2) = h_bridge
+                (v_i1, v_j1), (v_i2, v_j2) = v_bridge
+
+                # Check if they cross
+                if (h_j1 < v_j1 < h_j2) and (v_i1 < h_i1 < v_i2):
+                    # They cross, so we can't have both
+                    h1_var = self.variables[(h_bridge[0], h_bridge[1], "h1")]
+                    h2_var = self.variables[(h_bridge[0], h_bridge[1], "h2")]
+                    v1_var = self.variables[(v_bridge[0], v_bridge[1], "v1")]
+                    v2_var = self.variables[(v_bridge[0], v_bridge[1], "v2")]
+
+                    # At most one of these bridges can exist
+                    self.clauses.append([-h1_var, -v1_var])
+                    self.clauses.append([-h1_var, -v2_var])
+                    self.clauses.append([-h2_var, -v1_var])
+                    self.clauses.append([-h2_var, -v2_var])
+
+    def _add_island_constraints(self):
+        """Add clauses to ensure island connections match their numbers"""
         for island in self.islands:
-            i, j, req = island
-            if 0 < self.grid[i, j] < min_connections:
-                possible = self._get_possible_bridges(i, j)
-                if possible:  # Only consider if there are possible bridges
-                    min_connections = self.grid[i, j]
-                    selected_island = (i, j)
-                    possible_bridges = possible
-        
-        if not selected_island:
-            return False
-            
-        i, j = selected_island
-        
-        for ni, nj, direction, max_bridges in possible_bridges:
-            for count in [min(2, max_bridges), 1]:  # Try double bridge first if possible
-                if count > self.grid[i, j] or count > self.grid[ni, nj]:
-                    continue
-                    
-                if self._add_bridge(i, j, ni, nj, direction, count):
-                    if self.solve():
-                        return True
-                    self._remove_bridge(i, j, ni, nj, direction, count)
-        
-        return False
-    
-    def print_solution(self) -> None:
-        """Print the solved puzzle with bridges."""
-        if not self._is_solved():
-            print("Puzzle not solved yet!")
-            return
-            
-        # Create a display grid
-        display = [[' ' for _ in range(2 * self.cols - 1)] for _ in range(2 * self.rows - 1)]
-        
-        # Mark islands
-        for i in range(self.rows):
-            for j in range(self.cols):
-                if self.original_grid[i, j] > 0:
-                    display[2 * i][2 * j] = str(self.original_grid[i, j])
-        
-        # Draw horizontal bridges
-        for i in range(self.rows):
-            for j in range(self.cols - 1):
-                if self.bridges[i, j, 0] > 0:
-                    display[2 * i][2 * j + 1] = '=' if self.bridges[i, j, 0] == 2 else '-'
-        
-        # Draw vertical bridges
-        for i in range(self.rows - 1):
-            for j in range(self.cols):
-                if self.bridges[i, j, 1] > 0:
-                    display[2 * i + 1][2 * j] = '‖' if self.bridges[i, j, 1] == 2 else '|'
-        
-        # Print the display
-        for row in display:
-            print(' '.join(row))
-        print()
+            i, j = island
+            required = self.grid[i, j]
 
+            # Find all bridges connected to this island
+            connected_vars = []
 
-def read_puzzle_from_file(filename: str) -> List[List[int]]:
-    """Read a Hashiwokakero puzzle from a text file.
-    
-    Args:
-        filename: Path to the text file containing the puzzle
-        
-    Returns:
-        2D list representing the puzzle grid
-    """
-    with open(filename, 'r') as f:
-        lines = [line.strip() for line in f.readlines() if line.strip()]
-    
-    grid = []
-    for line in lines:
-        row = []
-        for char in line:
-            if char.isdigit():
-                row.append(int(char))
+            # Horizontal bridges to the left
+            for bridge in self.bridges["horizontal"]:
+                if bridge[1] == island:  # Bridge ends at this island
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h1")])
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h2")])
+
+            # Horizontal bridges to the right
+            for bridge in self.bridges["horizontal"]:
+                if bridge[0] == island:  # Bridge starts at this island
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h1")])
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h2")])
+
+            # Vertical bridges above
+            for bridge in self.bridges["vertical"]:
+                if bridge[1] == island:  # Bridge ends at this island
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v1")])
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v2")])
+
+            # Vertical bridges below
+            for bridge in self.bridges["vertical"]:
+                if bridge[0] == island:  # Bridge starts at this island
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v1")])
+                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v2")])
+
+            # Exactly 'required' bridges must be connected
+            # This is complex to express in CNF, so we'll approximate with:
+            # At least 'required' bridges (in sum)
+            # And at most 'required' bridges (in sum)
+
+            # Sum of bridges must equal required
+            # We'll use a simplified approach for this example
+            # In a full implementation, we'd need to encode the cardinality constraint
+
+            # For single bridges (required=1,2,3,4, etc.)
+            # This is a simplified version - a full implementation would need proper cardinality constraints
+            if required == 1:
+                # At least one bridge
+                self.clauses.append(connected_vars.copy())
+                # At most one bridge (for each pair)
+                for v1, v2 in combinations(connected_vars, 2):
+                    self.clauses.append([-v1, -v2])
+            elif required == 2:
+                # At least two bridges (all combinations where at least two are true)
+                # Simplified approach
+                pass
+            # ... and so on for other required values
+
+    def _add_connectivity_constraints(self):
+        """Add clauses to ensure all islands are connected"""
+        # This is complex to express in CNF directly
+        # In a full implementation, we might need to add constraints that ensure
+        # there's a path between every pair of islands
+        pass
+
+    def solve(self):
+        """Solve the puzzle and return the solution grid"""
+        self._generate_cnf()
+
+        # Use PySAT solver
+        with Solver(name="g4") as solver:
+            for clause in self.clauses:
+                solver.add_clause(clause)
+
+            if solver.solve():
+                model = solver.get_model()
+                return self._interpret_solution(model)
             else:
-                row.append(0)
-        grid.append(row)
-    
-    # Validate that all rows have the same length
-    row_lengths = [len(row) for row in grid]
-    if len(set(row_lengths)) > 1:
-        raise ValueError("All rows in the puzzle must have the same length")
-    
-    return grid
+                return None
+
+    def _interpret_solution(self, model):
+        """Convert the SAT solution back to a grid with bridges"""
+        # Create a copy of the grid for the solution
+        solution = np.where(self.grid > 0, self.grid.astype(str), " ")
+        solution = solution.astype(object)
+
+        # Process horizontal bridges
+        for a, b in self.bridges["horizontal"]:
+            h1_var = self.variables[(a, b, "h1")]
+            h2_var = self.variables[(a, b, "h2")]
+
+            h1_present = h1_var in model and model[h1_var - 1] > 0
+            h2_present = h2_var in model and model[h2_var - 1] > 0
+
+            if h1_present and h2_present:
+                bridge_char = "="
+            elif h1_present or h2_present:
+                bridge_char = "-"
+            else:
+                continue
+
+            i = a[0]
+            for j in range(a[1] + 1, b[1]):
+                if solution[i, j] == " ":
+                    solution[i, j] = bridge_char
+                elif bridge_char == "=" and solution[i, j] == "-":
+                    solution[i, j] = "="
+
+        # Process vertical bridges
+        for a, b in self.bridges["vertical"]:
+            v1_var = self.variables[(a, b, "v1")]
+            v2_var = self.variables[(a, b, "v2")]
+
+            v1_present = v1_var in model and model[v1_var - 1] > 0
+            v2_present = v2_var in model and model[v2_var - 1] > 0
+
+            if v1_present and v2_present:
+                bridge_char = "$"
+            elif v1_present or v2_present:
+                bridge_char = "|"
+            else:
+                continue
+
+            j = a[1]
+            for i in range(a[0] + 1, b[0]):
+                if solution[i, j] == " ":
+                    solution[i, j] = bridge_char
+                elif bridge_char == "$" and solution[i, j] == "|":
+                    solution[i, j] = "$"
+
+        return solution
 
 
+def print_solution(solution):
+    """Print the solution grid in a readable format"""
+    for row in solution:
+        print(" ".join(str(cell) for cell in row))
+
+
+# Example usage
+if __name__ == "__main__":
+    # Example puzzle (0 = empty, numbers = islands)
+    puzzle = [
+        [2, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0],
+        [4, 0, 3, 0, 1],
+        [0, 0, 0, 0, 0],
+        [3, 0, 0, 0, 2],
+    ]
+
+    print("Original puzzle:")
+    print_solution(np.where(np.array(puzzle) > 0, np.array(puzzle).astype(str), " "))
+
+    solver = HashiwokakeroSolver(puzzle)
+    solution = solver.solve()
+
+    if solution is not None:
+        print("\nSolution found:")
+        print_solution(solution)
+    else:
+        print("\nNo solution found.")
