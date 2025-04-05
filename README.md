@@ -1,1 +1,0 @@
-# Intro2AI_02-Hashiwokakero
