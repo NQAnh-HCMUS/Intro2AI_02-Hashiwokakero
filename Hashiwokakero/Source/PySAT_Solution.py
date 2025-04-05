@@ -1,7 +1,11 @@
+import time
 from pysat.formula import CNF, IDPool
 from pysat.card import CardEnc
 from pysat.solvers import Solver
 import os
+import tracemalloc
+import psutil
+
 def read_puzzle(matrix):
     """
     Đọc puzzle dưới dạng ma trận; mỗi ô khác 0 là đảo với số cầu cần nối.
@@ -113,7 +117,6 @@ def add_non_crossing_constraints(cnf, vpool, edges, islands):
     Với mỗi cặp cạnh, nếu một cạnh chạy ngang và một cạnh chạy dọc giao nhau,
     thêm mệnh đề: không cho phép cả 2 đều có cầu (x_e1 của mỗi cạnh không cùng bật).
     """
-    # Mỗi edge: extra = ('h', r, c_start, c_end) hoặc ('v', c, r_start, r_end)
     edge_list = [((i,j), extra) for (i,j,extra) in edges]
     n = len(edge_list)
     for idx1 in range(n):
@@ -125,18 +128,15 @@ def add_non_crossing_constraints(cnf, vpool, edges, islands):
                 c_start, c_end = extra1[2], extra1[3]
                 c = extra2[1]
                 r_start, r_end = extra2[2], extra2[3]
-                # Kiểm tra giao nhau
                 if r_start < r < r_end and c_start < c < c_end:
                     x1_e1 = vpool.id(('x', edge1[0], edge1[1], 1))
                     x1_e2 = vpool.id(('x', edge2[0], edge2[1], 1))
-                    # Không được bật cùng lúc cả hai cạnh
                     cnf.append([-x1_e1, -x1_e2])
             elif extra1[0]=='v' and extra2[0]=='h':
                 r = extra2[1]
                 c_start, c_end = extra2[2], extra2[3]
                 c = extra1[1]
                 r_start, r_end = extra1[2], extra1[3]
-                # Kiểm tra giao nhau
                 if r_start < r < r_end and c_start < c < c_end:
                     x1_e1 = vpool.id(('x', edge1[0], edge1[1], 1))
                     x1_e2 = vpool.id(('x', edge2[0], edge2[1], 1))
@@ -148,13 +148,11 @@ def check_connectivity(solution, islands):
     Kiểm tra xem đồ thị các đảo (nodes) với các cầu trong solution có liên thông hay không.
     Dựng đồ thị từ solution (chỉ xét các cạnh có cầu >= 1) và thực hiện DFS.
     """
-    # Xây dựng đồ thị: node -> danh sách kề
     graph = {i: [] for i in islands.keys()}
     for (i, j), count in solution.items():
         if count > 0:
             graph[i].append(j)
             graph[j].append(i)
-    # DFS để đếm số đảo visited
     visited = set()
     def dfs(u):
         visited.add(u)
@@ -194,21 +192,17 @@ def solve_hashiwokakero_lazy(matrix):
         used_literals = []  # lưu các biến x_e1 đang bật trong nghiệm hiện tại
 
         for (i, j), (x1, x2) in edge_vars.items():
-            # model[x1-1] > 0 nghĩa là x1 đang "True" (vì chỉ số trong model là x1-1)
             if model[x1-1] > 0:
                 count = 1
-                if model[x2-1] > 0:  # kiểm tra x2
+                if model[x2-1] > 0:
                     count = 2
                 solution[(i, j)] = count
                 used_literals.append(x1)
 
-        # Kiểm tra liên thông
         if check_connectivity(solution, islands):
             solver.delete()
             return solution, islands, edges
         else:
-            # Nghiệm không liên thông => chặn nghiệm này
-            # Thêm mệnh đề cấm tất cả x_e1 đã bật đồng thời
             solver.add_clause([-lit for lit in used_literals])
 
     solver.delete()
@@ -236,20 +230,16 @@ def print_solution(matrix, islands, edges, solution):
         r1, c1 = island_positions[i]
         r2, c2 = island_positions[j]
         if r1 == r2:
-            # Cầu ngang
             r = r1
             for c in range(min(c1, c2) + 1, max(c1, c2)):
                 output[r][c] = '-' if count == 1 else '='
         elif c1 == c2:
-            # Cầu dọc
             c = c1
             for r in range(min(r1, r2) + 1, max(r1, r2)):
                 output[r][c] = '|' if count == 1 else '$'
 
     for row in output:
         print(' '.join(row))
-
-
 
 def get_output_string(matrix, islands, edges, solution):
     """
@@ -259,7 +249,7 @@ def get_output_string(matrix, islands, edges, solution):
     """
     rows = len(matrix)
     cols = len(matrix[0])
-    grid = [[' ' for _ in range(cols)] for _ in range(rows)]
+    grid = [['0' for _ in range(cols)] for _ in range(rows)]
     
     # Đặt đảo vào vị trí
     island_positions = {}
@@ -283,14 +273,11 @@ def get_output_string(matrix, islands, edges, solution):
     # Tạo chuỗi output
     lines = []
     for row in grid:
-        # Mỗi phần tử được đưa vào trong dấu ngoặc kép và phân cách bằng " , "
         quoted = [f'"{cell}"' for cell in row]
         line = "[ " + " , ".join(quoted) + " ]"
         lines.append(line)
     return "\n".join(lines)
 
-
-# 9. Hàm ghi output ra file
 def write_output(output_folder, input_number, output_str):
     if not os.path.exists(output_folder):
         os.makedirs(output_folder)
@@ -299,34 +286,57 @@ def write_output(output_folder, input_number, output_str):
         f.write(output_str)
 
 
-# ------------------------ HÀM MAIN SỬA ĐỔI ------------------------
 def main():
-    """
-    Đọc 10 puzzle từ file input-1.txt đến input-10.txt (mỗi file là một ma trận),
-    giải và in kết quả.
-    """
-    import os
-    
+    total_start_time = time.time()
+    tracemalloc.start()  # Bắt đầu theo dõi cấp phát bộ nhớ
+    process = psutil.Process(os.getpid())
+
     for idx in range(1, 15):
         filename = f"input/input-{idx}.txt"
         if not os.path.exists(filename):
             print(f"File {filename} không tồn tại, bỏ qua.")
             continue
-        
+
         print(f"\n=== Đang giải puzzle {idx} từ file {filename} ===")
+        
+        # Đo thời gian và bộ nhớ trước khi giải puzzle
+        start_time = time.time()
+        start_memory = process.memory_info().rss  # rss tính bằng bytes
+
         with open(filename, 'r', encoding='utf-8') as f:
-            lines = [line.strip() for line in f if line.strip()]  # bỏ dòng trống
-        # Mỗi dòng là các số nguyên cách nhau
+            lines = [line.strip() for line in f if line.strip()]
         matrix = [list(map(int, line.split(","))) for line in lines]
-        
+
         solution, islands, edges = solve_hashiwokakero_lazy(matrix)
-        
+
         if solution is None:
-            print("Không tìm được lời giải cho puzzle.")
+            output_str = "Không tìm được lời giải cho puzzle."
+            print(output_str)
         else:
+            output_str = get_output_string(matrix, islands, edges, solution)
             print("\nBản đồ kết quả:")
             print_solution(matrix, islands, edges, solution)
 
-# Nếu muốn chạy file này trực tiếp:
+        write_output("output", idx, output_str)
+        print(f"Kết quả được ghi vào file: output_pysat/output-{idx}.txt")
+
+        # Đo thời gian và bộ nhớ sau khi giải puzzle
+        end_time = time.time()
+        end_memory = process.memory_info().rss
+
+        elapsed_time = end_time - start_time
+        memory_used_kb = (end_memory - start_memory) / 1024  # chuyển đổi sang KB
+
+        # Lấy thông tin từ tracemalloc
+        current, peak = tracemalloc.get_traced_memory()
+        print(f"\nPuzzle {idx}:")
+        print(f"  Thời gian xử lý: {elapsed_time:.4f} giây")
+        print(f"  Bộ nhớ sử dụng (psutil): {memory_used_kb:.5f} KB")
+
+    total_end_time = time.time()
+    total_elapsed = total_end_time - total_start_time
+    print(f"\nTổng thời gian xử lý tất cả puzzle: {total_elapsed:.4f} giây")
+    tracemalloc.stop()
+
 if __name__ == '__main__':
     main()

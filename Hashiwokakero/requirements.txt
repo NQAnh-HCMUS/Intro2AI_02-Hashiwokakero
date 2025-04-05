@@ -1,3 +1,4 @@
 python-sat
 numpy
 matplotlib
+psutil
