@@ -308,7 +308,7 @@ def main():
     import os
     
     for idx in range(1, 15):
-        filename = f"input/input-{idx}.txt"
+        filename = f"Inputs/input-{idx}.txt"
         if not os.path.exists(filename):
             print(f"File {filename} không tồn tại, bỏ qua.")
             continue
