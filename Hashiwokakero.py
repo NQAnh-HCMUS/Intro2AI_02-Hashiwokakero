@@ -1,265 +1,478 @@
-﻿from pysat.solvers import Solver
-from itertools import combinations, product
-import numpy as np
+﻿from pysat.formula import CNF, IDPool
+from pysat.card import CardEnc
+from pysat.solvers import Solver
 
+def read_puzzle(matrix):
+    """
+    Đọc puzzle dưới dạng ma trận; mỗi ô khác 0 là đảo với số cầu cần nối.
+    Trả về dictionary: island_id -> (row, col, required bridges)
+    """
+    islands = {}
+    island_id = 1
+    for i, row in enumerate(matrix):
+        for j, cell in enumerate(row):
+            if cell != 0:
+                islands[island_id] = (i, j, cell)
+                island_id += 1
+    return islands
 
-class HashiwokakeroSolver:
-    def __init__(self, grid):
-        self.grid = np.array(grid)
-        self.rows, self.cols = self.grid.shape
-        self.islands = self._find_islands()
-        self.bridges = self._find_potential_bridges()
-        self.variables = {}
-        self._setup_variables()
-        self.clauses = []
-
-    def _find_islands(self):
-        """Find all island coordinates in the grid"""
-        islands = []
-        for i in range(self.rows):
-            for j in range(self.cols):
-                if self.grid[i, j] > 0:
-                    islands.append((i, j))
-        return islands
-
-    def _find_potential_bridges(self):
-        """Find all potential horizontal and vertical bridges between islands"""
-        bridges = {"horizontal": [], "vertical": []}
-
-        # Find horizontal bridges (same row)
-        for (i1, j1), (i2, j2) in combinations(self.islands, 2):
-            if i1 == i2 and j1 < j2:
-                # Check if path is clear
-                path_clear = True
-                for j in range(j1 + 1, j2):
-                    if self.grid[i1, j] != 0 and (i1, j) not in self.islands:
-                        path_clear = False
+def compute_edges(islands, matrix):
+    """
+    Xác định các kết nối hợp lệ giữa các đảo.
+    Chỉ xét theo hướng phải (hàng) và xuống (cột) để tránh trùng lặp.
+    Trả về:
+      - edges: danh sách các tuple (id1, id2, extra) với extra chứa thông tin dạng:
+          * ('h', r, c_start, c_end) nếu kết nối ngang
+          * ('v', c, r_start, r_end) nếu kết nối dọc
+      - coord_to_id: ánh xạ từ tọa độ (row, col) sang id đảo.
+    """
+    edges = []
+    coord_to_id = {}
+    for id, (r, c, req) in islands.items():
+        coord_to_id[(r, c)] = id
+    rows = len(matrix)
+    cols = len(matrix[0])
+    for id, (r, c, req) in islands.items():
+        # Xét theo hàng: tìm đảo liền bên phải
+        for nc in range(c+1, cols):
+            if (r, nc) in coord_to_id:
+                valid = True
+                for cc in range(c+1, nc):
+                    if matrix[r][cc] != 0:
+                        valid = False
                         break
-                if path_clear:
-                    bridges["horizontal"].append(((i1, j1), (i1, j2)))
-
-        # Find vertical bridges (same column)
-        for (i1, j1), (i2, j2) in combinations(self.islands, 2):
-            if j1 == j2 and i1 < i2:
-                # Check if path is clear
-                path_clear = True
-                for i in range(i1 + 1, i2):
-                    if self.grid[i, j1] != 0 and (i, j1) not in self.islands:
-                        path_clear = False
+                if valid:
+                    id2 = coord_to_id[(r, nc)]
+                    edge = tuple(sorted((id, id2)))
+                    edges.append( (edge, ('h', r, c, nc)) )
+                break  # chỉ xét đảo liền kề đầu tiên
+        # Xét theo cột: tìm đảo liền bên dưới
+        for nr in range(r+1, rows):
+            if (nr, c) in coord_to_id:
+                valid = True
+                for rr in range(r+1, nr):
+                    if matrix[rr][c] != 0:
+                        valid = False
                         break
-                if path_clear:
-                    bridges["vertical"].append(((i1, j1), (i2, j1)))
+                if valid:
+                    id2 = coord_to_id[(nr, c)]
+                    edge = tuple(sorted((id, id2)))
+                    edges.append( (edge, ('v', c, r, nr)) )
+                break
+    # Loại bỏ các cạnh trùng lặp
+    unique_edges = {}
+    for (edge, extra) in edges:
+        if edge not in unique_edges:
+            unique_edges[edge] = extra
+    final_edges = [(edge[0], edge[1], extra) for edge, extra in unique_edges.items()]
+    return final_edges, coord_to_id
 
-        return bridges
+def add_domain_constraints(cnf, vpool, edges):
+    """
+    Với mỗi cạnh (edge), tạo ra 2 biến:
+      - x_e1: có ít nhất 1 cầu
+      - x_e2: cầu thứ hai (chỉ có thể bật khi x_e1 bật)
+    Ràng buộc: x_e2 -> x_e1 tương đương (-x_e2 v x_e1).
+    Trả về ánh xạ edge_vars: (id1, id2) -> (x_e1, x_e2)
+    """
+    edge_vars = {}
+    for (i, j, extra) in edges:
+        x1 = vpool.id(('x', i, j, 1))
+        x2 = vpool.id(('x', i, j, 2))
+        cnf.append([-x2, x1])
+        edge_vars[(i, j)] = (x1, x2)
+    return edge_vars
 
-    def _setup_variables(self):
-        """Assign variables to each potential bridge (1 or 2 bridges)"""
-        var_id = 1
+def add_island_constraints(cnf, vpool, islands, edge_vars):
+    """
+    Với mỗi đảo, tổng số cầu đến đảo phải bằng số yêu cầu.
+    Mỗi cạnh nối đến đảo đóng góp: 1 nếu x_e1 bật, cộng thêm 1 nếu x_e2 bật.
+    Sử dụng CardEnc.equals để tạo ràng buộc "bằng" một cách tối ưu.
+    """
+    island_edges = {id: [] for id in islands.keys()}
+    for (i, j), (x1, x2) in edge_vars.items():
+        if i in island_edges:
+            island_edges[i].extend([x1, x2])
+        if j in island_edges:
+            island_edges[j].extend([x1, x2])
+    for id, lits in island_edges.items():
+        req = islands[id][2]
+        if lits:
+            # Dùng encoding=1 (sequential counter) để mã hóa ràng buộc bằng.
+            card = CardEnc.equals(lits=lits, bound=req, vpool=vpool, encoding=1)
+            cnf.extend(card.clauses)
+        else:
+            # Nếu đảo có yêu cầu > 0 nhưng không có cạnh nối, puzzle không giải được.
+            cnf.append([])  # mệnh đề rỗng => unsat
+    return
 
-        # Create variables for horizontal bridges
-        for a, b in self.bridges["horizontal"]:
-            self.variables[(a, b, "h1")] = var_id
-            self.variables[(a, b, "h2")] = var_id + 1
-            var_id += 2
-
-        # Create variables for vertical bridges
-        for a, b in self.bridges["vertical"]:
-            self.variables[(a, b, "v1")] = var_id
-            self.variables[(a, b, "v2")] = var_id + 1
-            var_id += 2
-
-    def _generate_cnf(self):
-        """Generate CNF clauses for the puzzle"""
-        # 1. At most two bridges between any pair of islands
-        # (handled by having only two variables per bridge)
-
-        # 2. Bridges don't cross
-        self._add_no_crossing_clauses()
-
-        # 3. Island constraints
-        self._add_island_constraints()
-
-        # 4. Single connected component
-        self._add_connectivity_constraints()
-
-    def _add_no_crossing_clauses(self):
-        """Add clauses to prevent bridges from crossing"""
-        # Check all pairs of horizontal and vertical bridges that would cross
-        for h_bridge in self.bridges["horizontal"]:
-            for v_bridge in self.bridges["vertical"]:
-                (h_i1, h_j1), (h_i2, h_j2) = h_bridge
-                (v_i1, v_j1), (v_i2, v_j2) = v_bridge
-
-                # Check if they cross
-                if (h_j1 < v_j1 < h_j2) and (v_i1 < h_i1 < v_i2):
-                    # They cross, so we can't have both
-                    h1_var = self.variables[(h_bridge[0], h_bridge[1], "h1")]
-                    h2_var = self.variables[(h_bridge[0], h_bridge[1], "h2")]
-                    v1_var = self.variables[(v_bridge[0], v_bridge[1], "v1")]
-                    v2_var = self.variables[(v_bridge[0], v_bridge[1], "v2")]
-
-                    # At most one of these bridges can exist
-                    self.clauses.append([-h1_var, -v1_var])
-                    self.clauses.append([-h1_var, -v2_var])
-                    self.clauses.append([-h2_var, -v1_var])
-                    self.clauses.append([-h2_var, -v2_var])
-
-    def _add_island_constraints(self):
-        """Add clauses to ensure island connections match their numbers"""
-        for island in self.islands:
-            i, j = island
-            required = self.grid[i, j]
-
-            # Find all bridges connected to this island
-            connected_vars = []
-
-            # Horizontal bridges to the left
-            for bridge in self.bridges["horizontal"]:
-                if bridge[1] == island:  # Bridge ends at this island
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h1")])
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h2")])
-
-            # Horizontal bridges to the right
-            for bridge in self.bridges["horizontal"]:
-                if bridge[0] == island:  # Bridge starts at this island
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h1")])
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "h2")])
-
-            # Vertical bridges above
-            for bridge in self.bridges["vertical"]:
-                if bridge[1] == island:  # Bridge ends at this island
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v1")])
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v2")])
-
-            # Vertical bridges below
-            for bridge in self.bridges["vertical"]:
-                if bridge[0] == island:  # Bridge starts at this island
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v1")])
-                    connected_vars.append(self.variables[(bridge[0], bridge[1], "v2")])
-
-            # Exactly 'required' bridges must be connected
-            # This is complex to express in CNF, so we'll approximate with:
-            # At least 'required' bridges (in sum)
-            # And at most 'required' bridges (in sum)
-
-            # Sum of bridges must equal required
-            # We'll use a simplified approach for this example
-            # In a full implementation, we'd need to encode the cardinality constraint
-
-            # For single bridges (required=1,2,3,4, etc.)
-            # This is a simplified version - a full implementation would need proper cardinality constraints
-            if required == 1:
-                # At least one bridge
-                self.clauses.append(connected_vars.copy())
-                # At most one bridge (for each pair)
-                for v1, v2 in combinations(connected_vars, 2):
-                    self.clauses.append([-v1, -v2])
-            elif required == 2:
-                # At least two bridges (all combinations where at least two are true)
-                # Simplified approach
-                pass
-            # ... and so on for other required values
-
-    def _add_connectivity_constraints(self):
-        """Add clauses to ensure all islands are connected"""
-        # This is complex to express in CNF directly
-        # In a full implementation, we might need to add constraints that ensure
-        # there's a path between every pair of islands
-        pass
-
-    def solve(self):
-        """Solve the puzzle and return the solution grid"""
-        self._generate_cnf()
-
-        # Use PySAT solver
-        with Solver(name="g4") as solver:
-            for clause in self.clauses:
-                solver.add_clause(clause)
-
-            if solver.solve():
-                model = solver.get_model()
-                return self._interpret_solution(model)
-            else:
-                return None
-
-    def _interpret_solution(self, model):
-        """Convert the SAT solution back to a grid with bridges"""
-        # Create a copy of the grid for the solution
-        solution = np.where(self.grid > 0, self.grid.astype(str), " ")
-        solution = solution.astype(object)
-
-        # Process horizontal bridges
-        for a, b in self.bridges["horizontal"]:
-            h1_var = self.variables[(a, b, "h1")]
-            h2_var = self.variables[(a, b, "h2")]
-
-            h1_present = h1_var in model and model[h1_var - 1] > 0
-            h2_present = h2_var in model and model[h2_var - 1] > 0
-
-            if h1_present and h2_present:
-                bridge_char = "="
-            elif h1_present or h2_present:
-                bridge_char = "-"
-            else:
+def add_non_crossing_constraints(cnf, vpool, edges, islands):
+    """
+    Với mỗi cặp cạnh, nếu một cạnh chạy ngang và một chạy dọc giao nhau,
+    thêm mệnh đề: không cho phép cả 2 đều có cầu (x_e1 của mỗi cạnh không cùng bật).
+    """
+    # Mỗi edge có extra info: ('h', r, c_start, c_end) hoặc ('v', c, r_start, r_end)
+    for idx1, (edge1, extra1) in enumerate( [((i,j), extra) for (i,j,extra) in edges] ):
+        for idx2, (edge2, extra2) in enumerate( [((i,j), extra) for (i,j,extra) in edges] ):
+            if idx2 <= idx1:
                 continue
+            # Xét trường hợp một cạnh ngang và một cạnh dọc
+            if extra1[0]=='h' and extra2[0]=='v':
+                r = extra1[1]
+                c_start, c_end = extra1[2], extra1[3]
+                c = extra2[1]
+                r_start, r_end = extra2[2], extra2[3]
+                if r_start < r < r_end and c_start < c < c_end:
+                    x1_e1 = vpool.id(('x', edge1[0], edge1[1], 1))
+                    x1_e2 = vpool.id(('x', edge2[0], edge2[1], 1))
+                    cnf.append([-x1_e1, -x1_e2])
+            elif extra1[0]=='v' and extra2[0]=='h':
+                r = extra2[1]
+                c_start, c_end = extra2[2], extra2[3]
+                c = extra1[1]
+                r_start, r_end = extra1[2], extra1[3]
+                if r_start < r < r_end and c_start < c < c_end:
+                    x1_e1 = vpool.id(('x', edge1[0], edge1[1], 1))
+                    x1_e2 = vpool.id(('x', edge2[0], edge2[1], 1))
+                    cnf.append([-x1_e1, -x1_e2])
+    return
 
-            i = a[0]
-            for j in range(a[1] + 1, b[1]):
-                if solution[i, j] == " ":
-                    solution[i, j] = bridge_char
-                elif bridge_char == "=" and solution[i, j] == "-":
-                    solution[i, j] = "="
+def check_connectivity(solution, islands):
+    """
+    Kiểm tra xem đồ thị các đảo (nodes) với các cầu trong solution có liên thông hay không.
+    Dựng đồ thị từ solution (chỉ xét các cạnh có cầu >= 1) và thực hiện DFS.
+    """
+    # Xây dựng đồ thị dưới dạng dictionary: node -> danh sách các node kề.
+    graph = {i: [] for i in islands.keys()}
+    for (i, j), count in solution.items():
+        if count > 0:
+            graph[i].append(j)
+            graph[j].append(i)
+    visited = set()
+    def dfs(u):
+        visited.add(u)
+        for v in graph[u]:
+            if v not in visited:
+                dfs(v)
+    start = min(islands.keys())
+    dfs(start)
+    return len(visited) == len(islands)
 
-        # Process vertical bridges
-        for a, b in self.bridges["vertical"]:
-            v1_var = self.variables[(a, b, "v1")]
-            v2_var = self.variables[(a, b, "v2")]
+def solve_hashiwokakero_lazy(matrix):
+    """
+    Xây dựng CNF dựa trên puzzle (ma trận) và giải bằng PySAT mà KHÔNG mã hóa trực tiếp liên thông.
+    Sau đó, kiểm tra liên thông của nghiệm.
+    Nếu không liên thông, chặn nghiệm đó và tiếp tục giải.
+    Trả về solution (dictionary edge -> số cầu), islands, edges.
+    """
+    islands = read_puzzle(matrix)
+    edges, coord_to_id = compute_edges(islands, matrix)
+    
+    cnf = CNF()
+    vpool = IDPool()
+    
+    # Bước 1: Tạo biến và ràng buộc miền cho các cạnh.
+    edge_vars = add_domain_constraints(cnf, vpool, edges)
+    
+    # Bước 2: Ràng buộc số cầu của mỗi đảo.
+    add_island_constraints(cnf, vpool, islands, edge_vars)
+    
+    # Bước 3: Ràng buộc không giao nhau.
+    add_non_crossing_constraints(cnf, vpool, edges, islands)
+    
+    solver = Solver(name='glucose3')
+    solver.append_formula(cnf)
+    
+    while solver.solve():
+        model = solver.get_model()
+        solution = {}
+        used_literals = []  # Lưu lại các biến x_e1 mà ở nghiệm hiện tại được bật.
+        for (i, j), (x1, x2) in edge_vars.items():
+            if model[x1-1] > 0:
+                count = 1
+                if model[x2-1] > 0:
+                    count = 2
+                solution[(i, j)] = count
+                used_literals.append(x1)
+        if check_connectivity(solution, islands):
+            solver.delete()
+            return solution, islands, edges
+        else:
+            # Nếu nghiệm không liên thông, thêm mệnh đề chặn:
+            # Mệnh đề này buộc rằng không được dùng đồng thời tất cả các x_e1 trong nghiệm hiện tại.
+            solver.add_clause([-lit for lit in used_literals])
+    
+    solver.delete()
+    return None, islands, edges
 
-            v1_present = v1_var in model and model[v1_var - 1] > 0
-            v2_present = v2_var in model and model[v2_var - 1] > 0
+def print_solution(matrix, islands, edges, solution):
+    """
+    Hiển thị kết quả dưới dạng “bản đồ”:
+      - Đảo được in số cầu cần có.
+      - Cầu nối ngang được biểu diễn bằng '-' (1 cầu) hoặc '=' (2 cầu).
+      - Cầu nối dọc được biểu diễn bằng '|' (1 cầu) hoặc '$' (2 cầu).
+    """
+    rows = len(matrix)
+    cols = len(matrix[0])
+    output = [[' ' for _ in range(cols)] for _ in range(rows)]
+    
+    # Đặt đảo vào vị trí
+    island_positions = {}
+    for id, (r, c, req) in islands.items():
+        output[r][c] = str(req)
+        island_positions[id] = (r, c)
+    
+    # Vẽ cầu
+    for (i, j), count in solution.items():
+        r1, c1 = island_positions[i]
+        r2, c2 = island_positions[j]
+        if r1 == r2:
+            # Cầu ngang: điền các ô giữa
+            r = r1
+            for c in range(min(c1, c2)+1, max(c1, c2)):
+                output[r][c] = '-' if count == 1 else '='
+        elif c1 == c2:
+            # Cầu dọc: điền các ô giữa
+            c = c1
+            for r in range(min(r1, r2)+1, max(r1, r2)):
+                output[r][c] = '|' if count == 1 else '$'
+    
+    # In kết quả
+    for row in output:
+        print(' '.join(row))
 
-            if v1_present and v2_present:
-                bridge_char = "$"
-            elif v1_present or v2_present:
-                bridge_char = "|"
-            else:
-                continue
+if __name__ == '__main__':
+    # Ví dụ puzzle từ bạn: 
 
-            j = a[1]
-            for i in range(a[0] + 1, b[0]):
-                if solution[i, j] == " ":
-                    solution[i, j] = bridge_char
-                elif bridge_char == "$" and solution[i, j] == "|":
-                    solution[i, j] = "$"
-
-        return solution
-
-
-def print_solution(solution):
-    """Print the solution grid in a readable format"""
-    for row in solution:
-        print(" ".join(str(cell) for cell in row))
-
-
-# Example usage
-if __name__ == "__main__":
-    # Example puzzle (0 = empty, numbers = islands)
-    puzzle = [
-        [2, 0, 1, 0, 0],
-        [0, 0, 0, 0, 0],
-        [4, 0, 3, 0, 1],
-        [0, 0, 0, 0, 0],
-        [3, 0, 0, 0, 2],
+    puzzle2= [
+        [0 , 2 , 0 , 5 , 0 , 0 , 2],
+        [0 , 0 , 0 , 0 , 0 , 0 , 0],
+        [4 , 0 , 2 , 0 , 2 , 0 , 4],
+        [0 , 0 , 0 , 0 , 0 , 0 , 0],
+        [0 , 1 , 0 , 5 , 0 , 2 , 0],
+        [0 , 0 , 0 , 0 , 0 , 0 , 0],
+        [4 , 0 , 0 , 0 , 0 , 0 , 3],
     ]
 
-    print("Original puzzle:")
-    print_solution(np.where(np.array(puzzle) > 0, np.array(puzzle).astype(str), " "))
+    puzzle3= [
+            [2,0,0,0,0,1,0],
+            [0,0,2,0,0,0,3],
+            [0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,2],
+            [0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0],
+            [2,0,2,0,0,0,0],]
 
-    solver = HashiwokakeroSolver(puzzle)
-    solution = solver.solve()
+    puzzle9_1 = [
+            [0,0,3,0,2,0,0,0,1],
+            [0,0,0,0,0,0,0,0,0],
+            [1,0,5,0,0,0,1,0,0],
+            [0,0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0],
+            [0,0,2,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0],
+            [0,0,0,0,0,0,0,0,0],
+            [0,0,3,0,0,0,0,2,0]
+      ]
+    puzzle9_2 = [
+    [2,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,1],
+    [0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,2,0,0,4],
+    [0,0,0,0,0,0,0,0,0],
+    [5,0,0,0,0,0,0,0,3],
+    [0,0,0,0,0,0,0,0,0],
+    [3,0,1,0,0,0,0,0,1],
+    ]
 
+    puzzle11_1 = [
+    [2,0,0,0,0,0,0,2,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [4,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,1],
+    [0,0,3,0,0,0,0,6,0,1,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,1,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [3,0,0,0,0,0,0,4,0,0,3],
+
+]
+    puzzle11_2 = [
+    [0,4,0,0,0,0,0,0,3,0,2],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,3,0,0,0,0,0,3,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,1],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,3,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,4,0,0,2,0,0,0,0],
+    [0,3,0,0,0,0,0,0,0,2,0],
+
+]
+    puzzle13_1 = [
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [1,0,0,0,3,0,0,0,0,4,0,3,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,1,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [3,0,0,0,5,0,0,0,0,0,0,3,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [3,0,3,0,0,0,0,0,0,0,0,3,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [0,0,0,0,0,0,0,0,0,0,0,0,0],
+    [3,0,0,0,0,0,0,0,0,0,0,0,1],
+]
+    puzzle13_2 = [
+    [0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 3],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 2, 0, 0, 5, 0, 0, 0, 0, 4, 0, 1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+]
+
+    puzzle15_1 = [
+    [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 1, 0, 0],
+    [0, 0, 2, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 5, 0, 0, 0, 0],
+    [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 4, 0, 0, 2, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 4],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 3, 0, 1],
+]
+
+    puzzle15_2 = [
+    [1, 0, 5, 0, 0, 4, 0, 0, 0, 0, 2, 0, 0, 0, 1],
+    [0, 0, 0, 0, 0, 0, 1, 0, 0, 3, 0, 4, 0, 2, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 2],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [3, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [3, 0, 3, 0, 0, 6, 0, 0, 0, 4, 0, 0, 6, 0, 5],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 2, 0, 0, 0, 6, 0, 0, 0, 0, 4, 0, 5, 0, 4],
+    [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+]
+    puzzle17_1 = [
+    [3, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+    [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 4, 0],
+    [0, 0, 0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 1, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0],
+    [0, 0, 0, 4, 0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 3, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0],
+    [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 3, 0, 0, 0, 5, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0],
+    [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 3, 0, 3],
+    [0, 1, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 2, 0, 0, 1, 0],
+]
+
+    puzzle17_2 = [
+    [0, 1, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 3, 0, 1, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0],
+    [3, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 2, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 5, 0, 0, 0, 6, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [1, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0],
+]
+
+
+
+    puzzle20A = [
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [2, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0],
+    [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 3, 0, 0, 2, 0, 1],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 3, 0, 0, 0, 0, 0, 3, 0, 4, 0, 0, 0, 5, 0, 4, 0, 2, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 1, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 2, 0, 0, 0, 0, 6, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0],
+    [2, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 1, 0, 0, 2, 0, 0, 0, 0, 0],
+]
+    puzzle20B = [
+    [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    [0, 0, 0, 2, 0, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 2, 0, 1, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 2, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 2, 0],
+    [5, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 1, 0, 1, 0, 0, 0, 4, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 3],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 1, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 3, 0, 0, 0, 0, 0, 4, 0, 4, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0, 5, 0, 0, 0, 0, 0, 2, 0, 0],
+    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    [0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 4, 0, 0, 0, 0, 0, 2, 0, 0],
+    [3, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+]
+
+    solution, islands, edges = solve_hashiwokakero_lazy(puzzle17_2)
     if solution is not None:
-        print("\nSolution found:")
-        print_solution(solution)
+        print("Giải pháp các cầu (edge: số cầu):")
+        for edge, count in solution.items():
+            print(f"Đảo {edge[0]} - Đảo {edge[1]}: {count} cầu")
+        print("\nBản đồ kết quả:")
+        print_solution(puzzle17_2, islands, edges, solution)
     else:
-        print("\nNo solution found.")
+        print("Không tìm được lời giải cho puzzle.")
